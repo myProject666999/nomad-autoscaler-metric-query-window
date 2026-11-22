@@ -5,6 +5,7 @@ package nomad
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/hashicorp/nomad-autoscaler/sdk"
@@ -171,12 +172,27 @@ func parseCheck(c interface{}) *sdk.ScalingPolicyCheck {
 		queryWindowOffset, _ = time.ParseDuration(queryWindowOffsetStr)
 	}
 
+	// Parse query_min_points and query_max_staleness ignoring errors since we
+	// assume policy has been validated.
+	var queryMinPoints int
+	var queryMaxStaleness time.Duration
+	if v, ok := checkMap[keyQueryMinPoints]; ok {
+		if n, err := strconv.Atoi(fmt.Sprintf("%v", v)); err == nil {
+			queryMinPoints = n
+		}
+	}
+	if queryMaxStalenessStr, ok := checkMap[keyQueryMaxStaleness].(string); ok {
+		queryMaxStaleness, _ = time.ParseDuration(queryMaxStalenessStr)
+	}
+
 	return &sdk.ScalingPolicyCheck{
 		Group:             group,
 		Query:             query,
 		QueryWindow:       queryWindow,
 		QueryWindowOffset: queryWindowOffset,
 		QueryInstant:      queryInstant,
+		QueryMinPoints:    queryMinPoints,
+		QueryMaxStaleness: queryMaxStaleness,
 		Schedule:          parseSchedule(checkMap[keySchedule]),
 		Source:            source,
 		Strategy:          strategy,

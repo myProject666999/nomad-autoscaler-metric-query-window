@@ -737,3 +737,110 @@ func Test_validateBlock(t *testing.T) {
 		})
 	}
 }
+
+func Test_validateCheck_QueryWindowAndSufficiency(t *testing.T) {
+	validCheckMap := func(extra map[string]interface{}) map[string]interface{} {
+		c := map[string]interface{}{
+			keySource: "source",
+			keyQuery:  "query",
+			keyStrategy: []interface{}{
+				map[string]interface{}{
+					"strategy": []interface{}{
+						map[string]interface{}{
+							"key": "value",
+						},
+					},
+				},
+			},
+		}
+		for k, v := range extra {
+			c[k] = v
+		}
+		return c
+	}
+
+	testCases := []struct {
+		name        string
+		extra       map[string]interface{}
+		expectError bool
+	}{
+		{
+			name:  "valid query_window",
+			extra: map[string]interface{}{keyQueryWindow: "5m"},
+		},
+		{
+			name:  "instant query_window",
+			extra: map[string]interface{}{keyQueryWindow: "instant"},
+		},
+		{
+			name:        "negative query_window rejected",
+			extra:       map[string]interface{}{keyQueryWindow: "-5m"},
+			expectError: true,
+		},
+		{
+			name:  "valid query_window_offset",
+			extra: map[string]interface{}{keyQueryWindowOffset: "1m"},
+		},
+		{
+			name:        "negative query_window_offset rejected",
+			extra:       map[string]interface{}{keyQueryWindowOffset: "-1m"},
+			expectError: true,
+		},
+		{
+			name:        "non-string query_window_offset rejected",
+			extra:       map[string]interface{}{keyQueryWindowOffset: 5},
+			expectError: true,
+		},
+		{
+			name: "offset greater than window allowed",
+			extra: map[string]interface{}{
+				keyQueryWindow:       "5m",
+				keyQueryWindowOffset: "24h",
+			},
+		},
+		{
+			name:        "invalid query_window_offset rejected",
+			extra:       map[string]interface{}{keyQueryWindowOffset: "not-a-duration"},
+			expectError: true,
+		},
+		{
+			name:  "valid query_min_points",
+			extra: map[string]interface{}{keyQueryMinPoints: "3"},
+		},
+		{
+			name:        "negative query_min_points rejected",
+			extra:       map[string]interface{}{keyQueryMinPoints: "-1"},
+			expectError: true,
+		},
+		{
+			name:        "non-integer query_min_points rejected",
+			extra:       map[string]interface{}{keyQueryMinPoints: "abc"},
+			expectError: true,
+		},
+		{
+			name:  "valid query_max_staleness",
+			extra: map[string]interface{}{keyQueryMaxStaleness: "30s"},
+		},
+		{
+			name:        "negative query_max_staleness rejected",
+			extra:       map[string]interface{}{keyQueryMaxStaleness: "-30s"},
+			expectError: true,
+		},
+		{
+			name:        "invalid query_max_staleness rejected",
+			extra:       map[string]interface{}{keyQueryMaxStaleness: "junk"},
+			expectError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCheck(validCheckMap(tc.extra), "scaling.policy.check", "check")
+			if tc.expectError {
+				must.Error(t, err)
+			} else {
+				must.NoError(t, err)
+			}
+		})
+	}
+}

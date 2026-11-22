@@ -4,6 +4,7 @@
 package file
 
 import (
+	"fmt"
 	"time"
 
 	multierror "github.com/hashicorp/go-multierror"
@@ -80,7 +81,7 @@ func decodePolicyDoc(decodePolicy *sdk.FileDecodeScalingPolicy) error {
 
 		if check.QueryWindowHCL != "" {
 			if check.QueryWindowHCL != "instant" {
-				w, err := time.ParseDuration(check.QueryWindowHCL)
+				w, err := parseNonNegativeDuration(check.QueryWindowHCL, "query_window", check.Name)
 				if err != nil {
 					return err
 				}
@@ -89,13 +90,38 @@ func decodePolicyDoc(decodePolicy *sdk.FileDecodeScalingPolicy) error {
 		}
 
 		if check.QueryWindowOffsetHCL != "" {
-			o, err := time.ParseDuration(check.QueryWindowOffsetHCL)
+			o, err := parseNonNegativeDuration(check.QueryWindowOffsetHCL, "query_window_offset", check.Name)
 			if err != nil {
 				return err
 			}
 			decodePolicy.Doc.Checks[i].QueryWindowOffset = o
 		}
+
+		if check.QueryMaxStalenessHCL != "" {
+			s, err := parseNonNegativeDuration(check.QueryMaxStalenessHCL, "query_max_staleness", check.Name)
+			if err != nil {
+				return err
+			}
+			decodePolicy.Doc.Checks[i].QueryMaxStaleness = s
+		}
+
+		if check.QueryMinPoints < 0 {
+			return fmt.Errorf("check %s: query_min_points must not be negative", check.Name)
+		}
 	}
 
 	return nil
+}
+
+// parseNonNegativeDuration parses a time.Duration and rejects negative
+// values, which have no valid meaning for check query parameters.
+func parseNonNegativeDuration(v, key, checkName string) (time.Duration, error) {
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("check %s: %s must not be negative", checkName, key)
+	}
+	return d, nil
 }

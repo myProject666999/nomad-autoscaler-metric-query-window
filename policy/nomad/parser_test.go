@@ -454,3 +454,32 @@ func Test_parseSchedule(t *testing.T) {
 		must.Eq(t, &sdk.ScalingPolicySchedule{Start: "0 9 * * *", Duration: "8h"}, schedule)
 	})
 }
+
+func Test_parseCheck_QuerySufficiencyFields(t *testing.T) {
+	check := parseCheck([]interface{}{
+		map[string]interface{}{
+			keySource:            "prometheus",
+			keyQuery:             "avg(up)",
+			keyQueryWindow:       "5m",
+			keyQueryWindowOffset: "1m",
+			keyQueryMinPoints:    "3",
+			keyQueryMaxStaleness: "30s",
+			keyStrategy: []interface{}{
+				map[string]interface{}{
+					"threshold": []interface{}{
+						map[string]interface{}{
+							"within_bounds_trigger": 1,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	must.NotNil(t, check)
+	must.Eq(t, 5*time.Minute, check.QueryWindow)
+	must.Eq(t, time.Minute, check.QueryWindowOffset)
+	must.False(t, check.QueryInstant)
+	must.Eq(t, 3, check.QueryMinPoints)
+	must.Eq(t, 30*time.Second, check.QueryMaxStaleness)
+}

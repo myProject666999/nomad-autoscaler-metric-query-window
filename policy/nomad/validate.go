@@ -6,6 +6,7 @@ package nomad
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
@@ -220,9 +221,36 @@ func validateCheck(c map[string]interface{}, path string, label string) error {
 
 	// Validate QueryWindow, if present.
 	//   1. QueryWindow should be a valid time duration or the literal "instant".
+	//   2. QueryWindow must not be negative.
 	queryWindow, ok := c[keyQueryWindow]
 	if ok {
 		if err := validateDurationOrInstant(queryWindow, path+"."+keyQueryWindow); err != nil {
+			result = multierror.Append(result, err)
+		}
+	}
+
+	// Validate QueryWindowOffset, if present.
+	//   1. QueryWindowOffset should be a valid time duration.
+	//   2. QueryWindowOffset must not be negative. Values greater than or
+	//      equal to the window are allowed and query historical data.
+	if queryWindowOffset, ok := c[keyQueryWindowOffset]; ok {
+		if err := validateNonNegativeDuration(queryWindowOffset, path+"."+keyQueryWindowOffset); err != nil {
+			result = multierror.Append(result, err)
+		}
+	}
+
+	// Validate QueryMinPoints, if present.
+	//   1. QueryMinPoints should be a non-negative integer.
+	if minPoints, ok := c[keyQueryMinPoints]; ok {
+		if err := validateNonNegativeInt(minPoints, path+"."+keyQueryMinPoints); err != nil {
+			result = multierror.Append(result, err)
+		}
+	}
+
+	// Validate QueryMaxStaleness, if present.
+	//   1. QueryMaxStaleness should be a valid, non-negative time duration.
+	if maxStaleness, ok := c[keyQueryMaxStaleness]; ok {
+		if err := validateNonNegativeDuration(maxStaleness, path+"."+keyQueryMaxStaleness); err != nil {
 			result = multierror.Append(result, err)
 		}
 	}
@@ -381,8 +409,53 @@ func validateDurationOrInstant(d interface{}, path string) error {
 		return nil
 	}
 
-	if _, err := time.ParseDuration(dStr); err != nil {
+	duration, err := time.ParseDuration(dStr)
+	if err != nil {
 		return fmt.Errorf("%s must have time.Duration format or be \"instant\", found %q", path, dStr)
+	}
+
+	if duration < 0 {
+		return fmt.Errorf("%s must not be negative, found %q", path, dStr)
+	}
+
+	return nil
+}
+
+// validateNonNegativeDuration validates if the input has a valid,
+// non-negative time.Duration format.
+//
+// Validation rules:
+//  1. Input must be a string.
+//  2. Input must parse to a time.Duration.
+//  3. The duration must not be negative.
+func validateNonNegativeDuration(d interface{}, path string) error {
+	dStr, ok := d.(string)
+	if !ok {
+		return fmt.Errorf("%s must be string, found %T", path, d)
+	}
+
+	duration, err := time.ParseDuration(dStr)
+	if err != nil {
+		return fmt.Errorf(`%s must have time.Duration format, found "%s"`, path, dStr)
+	}
+
+	if duration < 0 {
+		return fmt.Errorf("%s must not be negative, found %q", path, dStr)
+	}
+
+	return nil
+}
+
+// validateNonNegativeInt validates if the input represents a non-negative
+// integer.
+func validateNonNegativeInt(in interface{}, path string) error {
+	n, err := strconv.Atoi(fmt.Sprintf("%v", in))
+	if err != nil {
+		return fmt.Errorf("%s must be an integer, found %v", path, in)
+	}
+
+	if n < 0 {
+		return fmt.Errorf("%s must not be negative, found %d", path, n)
 	}
 
 	return nil

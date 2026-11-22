@@ -310,3 +310,69 @@ func TestFileDecodePolicy_Translate(t *testing.T) {
 		})
 	}
 }
+
+func TestScalingPolicy_Validate_QueryWindowRules(t *testing.T) {
+	mkPolicy := func(c *ScalingPolicyCheck) *ScalingPolicy {
+		c.Strategy = &ScalingPolicyStrategy{Name: "target-value"}
+		return &ScalingPolicy{
+			Type:   "horizontal",
+			Checks: []*ScalingPolicyCheck{c},
+		}
+	}
+
+	testCases := []struct {
+		name          string
+		check         *ScalingPolicyCheck
+		expectedError string
+	}{
+		{
+			name:          "negative query_window",
+			check:         &ScalingPolicyCheck{Name: "c", QueryWindow: -time.Minute},
+			expectedError: "invalid query_window in check c",
+		},
+		{
+			name:          "negative query_window_offset",
+			check:         &ScalingPolicyCheck{Name: "c", QueryWindowOffset: -time.Minute},
+			expectedError: "invalid query_window_offset in check c",
+		},
+		{
+			name:          "negative query_min_points",
+			check:         &ScalingPolicyCheck{Name: "c", QueryMinPoints: -1},
+			expectedError: "invalid query_min_points in check c",
+		},
+		{
+			name:          "negative query_max_staleness",
+			check:         &ScalingPolicyCheck{Name: "c", QueryMaxStaleness: -time.Second},
+			expectedError: "invalid query_max_staleness in check c",
+		},
+		{
+			name: "offset greater than window allowed",
+			check: &ScalingPolicyCheck{
+				Name:              "c",
+				QueryWindow:       5 * time.Minute,
+				QueryWindowOffset: 24 * time.Hour,
+			},
+		},
+		{
+			name: "valid sufficiency fields",
+			check: &ScalingPolicyCheck{
+				Name:              "c",
+				QueryWindow:       5 * time.Minute,
+				QueryMinPoints:    3,
+				QueryMaxStaleness: 30 * time.Second,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := mkPolicy(tc.check).Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}

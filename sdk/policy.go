@@ -140,6 +140,26 @@ func (p *ScalingPolicy) Validate() error {
 				c.Name, ScalingPolicyOnErrorFail, ScalingPolicyOnErrorIgnore)
 			result = multierror.Append(result, err)
 		}
+
+		if c.QueryWindow < 0 {
+			err := fmt.Errorf("invalid query_window in check %s: must not be negative", c.Name)
+			result = multierror.Append(result, err)
+		}
+
+		if c.QueryWindowOffset < 0 {
+			err := fmt.Errorf("invalid query_window_offset in check %s: must not be negative", c.Name)
+			result = multierror.Append(result, err)
+		}
+
+		if c.QueryMinPoints < 0 {
+			err := fmt.Errorf("invalid query_min_points in check %s: must not be negative", c.Name)
+			result = multierror.Append(result, err)
+		}
+
+		if c.QueryMaxStaleness < 0 {
+			err := fmt.Errorf("invalid query_max_staleness in check %s: must not be negative", c.Name)
+			result = multierror.Append(result, err)
+		}
 	}
 
 	return errHelper.FormattedMultiError(result)
@@ -178,6 +198,17 @@ type ScalingPolicyCheck struct {
 	// QueryWindow. This behavior depends on the source plugin. For Prometheus,
 	// this maps to the instant query API.
 	QueryInstant bool
+
+	// QueryMinPoints is the minimum number of valid data points the query
+	// must return for the check to be evaluated. When zero (the default) no
+	// minimum is enforced. It is not applied to instant queries, which are
+	// expected to return a single point.
+	QueryMinPoints int
+
+	// QueryMaxStaleness is the maximum allowed age of the newest data point,
+	// measured against the end of the query window. When zero (the default)
+	// no staleness limit is enforced.
+	QueryMaxStaleness time.Duration
 
 	// Schedule controls when the check has effect. When set, evaluations that
 	// happen outside the active window produce no effect for this check.
@@ -293,7 +324,10 @@ type FileDecodePolicyCheckDoc struct {
 	QueryWindow          time.Duration
 	QueryWindowHCL       string `hcl:"query_window,optional"`
 	QueryWindowOffset    time.Duration
-	QueryWindowOffsetHCL string                 `hcl:"query_window_offset,optional"`
+	QueryWindowOffsetHCL string `hcl:"query_window_offset,optional"`
+	QueryMinPoints       int    `hcl:"query_min_points,optional"`
+	QueryMaxStaleness    time.Duration
+	QueryMaxStalenessHCL string                 `hcl:"query_max_staleness,optional"`
 	Schedule             *ScalingPolicySchedule `hcl:"schedule,block"`
 	OnError              string                 `hcl:"on_error,optional"`
 	Strategy             *ScalingPolicyStrategy `hcl:"strategy,block"`
@@ -342,6 +376,8 @@ func (fdc *FileDecodePolicyCheckDoc) Translate(c *ScalingPolicyCheck) {
 	c.QueryWindow = fdc.QueryWindow
 	c.QueryWindowOffset = fdc.QueryWindowOffset
 	c.QueryInstant = fdc.QueryWindowHCL == "instant"
+	c.QueryMinPoints = fdc.QueryMinPoints
+	c.QueryMaxStaleness = fdc.QueryMaxStaleness
 	c.Schedule = fdc.Schedule
 	c.OnError = fdc.OnError
 	c.Strategy = fdc.Strategy

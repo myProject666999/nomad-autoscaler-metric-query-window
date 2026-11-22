@@ -6,11 +6,14 @@ package policy
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"testing"
 	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad-autoscaler/plugins"
+	"github.com/hashicorp/nomad-autoscaler/plugins/apm"
 	"github.com/hashicorp/nomad-autoscaler/sdk"
 	"github.com/shoenig/test"
 	"github.com/shoenig/test/must"
@@ -451,4 +454,526 @@ func TestCheckHandler_runCheckAndCapCount_FixedValueSkipsAPMQuery(t *testing.T) 
 	test.Eq(t, sdk.ScaleDirectionUp, action.Direction)
 	test.Eq(t, 0, ml.queryCalls, test.Sprint("should not have made any apm queries"))
 	test.Eq(t, 1, sr.runCalls)
+}
+
+// fakeAPMLooker is a fake apm.Looker that records the time ranges it was
+// queried with and returns programmed results in call order. When called
+// more times than there are results, the last result is repeated.
+type fakeAPMLooker struct {
+	results []fakeAPMResult
+	calls   int
+	queries []string
+	ranges  []sdk.TimeRange
+}
+
+type fakeAPMResult struct {
+	metrics sdk.TimestampedMetrics
+	err     error
+}
+
+func (m *fakeAPMLooker) Query(query string, r sdk.TimeRange) (sdk.TimestampedMetrics, error) {
+	m.queries = append(m.queries, query)
+	m.ranges = append(m.ranges, r)
+	res := m.results[len(m.results)-1]
+	if m.calls < len(m.results) {
+		res = m.results[m.calls]
+	}
+	m.calls++
+	return res.metrics, res.err
+}
+
+func (m *fakeAPMLooker) QueryMultiple(string, sdk.TimeRange) ([]sdk.TimestampedMetrics, error) {
+	return nil, nil
+}
+
+// testNow is the fixed evaluation time used by the queryMetrics tests:
+// 10:00:00 exactly.
+var testNow = time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+
+func fixNow(t *testing.T) {
+	t.Helper()
+	nowFunc = func() time.Time { return testNow }
+	t.Cleanup(func() { nowFunc = time.Now })
+}
+
+// ts is a shorthand for building timestamps relative to testNow.
+func ts(m, s int) time.Time {
+	return testNow.Add(time.Duration(m)*time.Minute + time.Duration(s)*time.Second)
+}
+
+func newTestCheckRunner(looker apm.Looker, check *sdk.ScalingPolicyCheck, p *sdk.ScalingPolicy) *checkRunner {
+	if p == nil {
+		p = &sdk.ScalingPolicy{ID: "testPolicy"}
+	}
+	if check.Strategy == nil {
+		check.Strategy = &sdk.ScalingPolicyStrategy{Name: "strategy"}
+	}
+	return newCheckRunner(&CheckRunnerConfig{
+		Log:           hclog.NewNullLogger(),
+		MetricsGetter: looker,
+		Policy:        p,
+	}, check)
+}
+
+func TestCheckHandler_queryMetrics_TimeRangeComputation(t *testing.T) {
+	fixNow(t)
+
+	testCases := []struct {
+		name     string
+		window   time.Duration
+		offset   time.Duration
+		instant  bool
+		wantFrom time.Time
+		wantTo   time.Time
+	}{
+		{
+			name:     "window_and_offset",
+			window:   5 * time.Minute,
+			offset:   time.Minute,
+			wantFrom: ts(-6, 0), // 09:54:00
+			wantTo:   ts(-1, 0), // 09:59:00
+		},
+		{
+			name:     "window_without_offset",
+			window:   5 * time.Minute,
+			offset:   0,
+			wantFrom: ts(-5, 0), // 09:55:00
+			wantTo:   ts(0, 0),  // 10:00:00
+		},
+		{
+			name:     "instant_with_offset",
+			window:   5 * time.Minute,
+			offset:   time.Minute,
+			instant:  true,
+			wantFrom: ts(-1, 0), // 09:59:00
+			wantTo:   ts(-1, 0), // 09:59:00
+		},
+		{
+			name:     "instant_without_offset",
+			window:   5 * time.Minute,
+			offset:   0,
+			instant:  true,
+			wantFrom: ts(0, 0),
+			wantTo:   ts(0, 0),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			looker := &fakeAPMLooker{results: []fakeAPMResult{{
+				metrics: sdk.TimestampedMetrics{{Timestamp: tc.wantTo, Value: 1}},
+			}}}
+
+			runner := newTestCheckRunner(looker, &sdk.ScalingPolicyCheck{
+				Name:              "check",
+				Source:            "mock",
+				Query:             "query",
+				QueryWindow:       tc.window,
+				QueryWindowOffset: tc.offset,
+				QueryInstant:      tc.instant,
+			}, nil)
+
+			_, err := runner.queryMetrics(context.Background(), nil)
+			must.NoError(t, err)
+			must.Eq(t, 1, looker.calls)
+			must.Eq(t, sdk.TimeRange{From: tc.wantFrom, To: tc.wantTo}, looker.ranges[0])
+		})
+	}
+}
+
+func TestCheckHandler_queryMetrics_Filtering(t *testing.T) {
+	fixNow(t)
+
+	// Window [09:54:00, 09:59:00] as specified: now=10:00:00, window=5m,
+	// offset=1m.
+	window := 5 * time.Minute
+	offset := time.Minute
+
+	testCases := []struct {
+		name    string
+		instant bool
+		input   sdk.TimestampedMetrics
+		want    sdk.TimestampedMetrics
+	}{
+		{
+			name: "out_of_window_non_finite_and_duplicates_dropped",
+			input: sdk.TimestampedMetrics{
+				{Timestamp: ts(-6, -30), Value: 1},        // 09:53:30, before window
+				{Timestamp: ts(-5, 0), Value: 2},          // 09:55:00, first occurrence
+				{Timestamp: ts(-5, 0), Value: 3},          // 09:55:00, last occurrence wins
+				{Timestamp: ts(-3, 0), Value: math.NaN()}, // 09:57:00, NaN
+				{Timestamp: ts(0, -90), Value: 5},         // 09:58:30
+			},
+			want: sdk.TimestampedMetrics{
+				{Timestamp: ts(-5, 0), Value: 3},
+				{Timestamp: ts(0, -90), Value: 5},
+			},
+		},
+		{
+			name: "infinities_dropped",
+			input: sdk.TimestampedMetrics{
+				{Timestamp: ts(-4, 0), Value: math.Inf(1)},
+				{Timestamp: ts(-3, 0), Value: math.Inf(-1)},
+				{Timestamp: ts(-2, 0), Value: 7},
+			},
+			want: sdk.TimestampedMetrics{
+				{Timestamp: ts(-2, 0), Value: 7},
+			},
+		},
+		{
+			name: "window_boundaries_are_closed",
+			input: sdk.TimestampedMetrics{
+				{Timestamp: ts(-6, 0), Value: 1},  // exactly from: kept
+				{Timestamp: ts(-1, 0), Value: 2},  // exactly to: kept
+				{Timestamp: ts(0, 0), Value: 3},   // after to: dropped
+				{Timestamp: ts(-6, -1), Value: 4}, // before from: dropped
+			},
+			want: sdk.TimestampedMetrics{
+				{Timestamp: ts(-6, 0), Value: 1},
+				{Timestamp: ts(-1, 0), Value: 2},
+			},
+		},
+		{
+			name: "unsorted_input_is_sorted",
+			input: sdk.TimestampedMetrics{
+				{Timestamp: ts(-2, 0), Value: 3},
+				{Timestamp: ts(-4, 0), Value: 1},
+				{Timestamp: ts(-3, 0), Value: 2},
+			},
+			want: sdk.TimestampedMetrics{
+				{Timestamp: ts(-4, 0), Value: 1},
+				{Timestamp: ts(-3, 0), Value: 2},
+				{Timestamp: ts(-2, 0), Value: 3},
+			},
+		},
+		{
+			name:    "instant_skips_window_filtering_but_not_non_finite",
+			instant: true,
+			input: sdk.TimestampedMetrics{
+				// Timestamp far from `to` is still valid for instant queries.
+				{Timestamp: ts(-6, -30), Value: 1},
+				{Timestamp: ts(-1, 0), Value: math.NaN()},
+			},
+			want: sdk.TimestampedMetrics{
+				{Timestamp: ts(-6, -30), Value: 1},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			looker := &fakeAPMLooker{results: []fakeAPMResult{{metrics: tc.input}}}
+
+			runner := newTestCheckRunner(looker, &sdk.ScalingPolicyCheck{
+				Name:              "check",
+				Source:            "mock",
+				Query:             "query",
+				QueryWindow:       window,
+				QueryWindowOffset: offset,
+				QueryInstant:      tc.instant,
+			}, nil)
+
+			got, err := runner.queryMetrics(context.Background(), nil)
+			must.NoError(t, err)
+			must.Eq(t, tc.want, got)
+		})
+	}
+}
+
+func TestCheckHandler_queryMetrics_EmptyResults(t *testing.T) {
+	fixNow(t)
+
+	testCases := []struct {
+		name  string
+		input sdk.TimestampedMetrics
+	}{
+		{
+			name:  "apm_returns_empty",
+			input: sdk.TimestampedMetrics{},
+		},
+		{
+			name: "all_points_filtered",
+			input: sdk.TimestampedMetrics{
+				{Timestamp: ts(-30, 0), Value: 1},          // outside window
+				{Timestamp: ts(-2, 0), Value: math.NaN()},  // non-finite
+				{Timestamp: ts(-3, 0), Value: math.Inf(1)}, // non-finite
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			looker := &fakeAPMLooker{results: []fakeAPMResult{{metrics: tc.input}}}
+
+			runner := newTestCheckRunner(looker, &sdk.ScalingPolicyCheck{
+				Name:              "check",
+				Source:            "mock",
+				Query:             "query",
+				QueryWindow:       5 * time.Minute,
+				QueryWindowOffset: time.Minute,
+			}, nil)
+
+			_, err := runner.queryMetrics(context.Background(), nil)
+			must.ErrorIs(t, err, errNoMetrics)
+		})
+	}
+}
+
+func TestCheckHandler_queryMetrics_MinPoints(t *testing.T) {
+	fixNow(t)
+
+	singlePoint := sdk.TimestampedMetrics{{Timestamp: ts(-2, 0), Value: 1}}
+
+	testCases := []struct {
+		name      string
+		instant   bool
+		minPoints int
+		wantErr   error
+	}{
+		{name: "single_point_allowed_by_default", minPoints: 0},
+		{name: "single_point_meets_minimum_of_one", minPoints: 1},
+		{name: "single_point_below_minimum", minPoints: 2, wantErr: errInsufficientMetrics},
+		{name: "instant_exempt_from_minimum", instant: true, minPoints: 2},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			looker := &fakeAPMLooker{results: []fakeAPMResult{{metrics: singlePoint}}}
+
+			runner := newTestCheckRunner(looker, &sdk.ScalingPolicyCheck{
+				Name:              "check",
+				Source:            "mock",
+				Query:             "query",
+				QueryWindow:       5 * time.Minute,
+				QueryWindowOffset: time.Minute,
+				QueryInstant:      tc.instant,
+				QueryMinPoints:    tc.minPoints,
+			}, nil)
+
+			got, err := runner.queryMetrics(context.Background(), nil)
+			if tc.wantErr != nil {
+				must.ErrorIs(t, err, tc.wantErr)
+				return
+			}
+			must.NoError(t, err)
+			must.Eq(t, singlePoint, got)
+		})
+	}
+}
+
+func TestCheckHandler_queryMetrics_MaxStaleness(t *testing.T) {
+	fixNow(t)
+
+	// The newest point is 30s behind the query window end (to=09:59:00).
+	metrics := sdk.TimestampedMetrics{
+		{Timestamp: ts(-5, 0), Value: 1},
+		{Timestamp: ts(-1, -30), Value: 2}, // 09:58:30
+	}
+
+	testCases := []struct {
+		name         string
+		instant      bool
+		maxStaleness time.Duration
+		wantErr      error
+	}{
+		{name: "unset_staleness_limit_allows_any_age", maxStaleness: 0},
+		{name: "sixty_second_limit_passes", maxStaleness: 60 * time.Second},
+		{name: "limit_equal_to_age_passes", maxStaleness: 30 * time.Second},
+		{name: "twenty_second_limit_is_stale", maxStaleness: 20 * time.Second, wantErr: errInsufficientMetrics},
+		{name: "instant_applies_staleness", instant: true, maxStaleness: 20 * time.Second, wantErr: errInsufficientMetrics},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			looker := &fakeAPMLooker{results: []fakeAPMResult{{metrics: metrics}}}
+
+			runner := newTestCheckRunner(looker, &sdk.ScalingPolicyCheck{
+				Name:              "check",
+				Source:            "mock",
+				Query:             "query",
+				QueryWindow:       5 * time.Minute,
+				QueryWindowOffset: time.Minute,
+				QueryInstant:      tc.instant,
+				QueryMaxStaleness: tc.maxStaleness,
+			}, nil)
+
+			got, err := runner.queryMetrics(context.Background(), nil)
+			if tc.wantErr != nil {
+				must.ErrorIs(t, err, tc.wantErr)
+				return
+			}
+			must.NoError(t, err)
+			must.Eq(t, metrics, got)
+		})
+	}
+}
+
+func TestCheckHandler_queryMetricsCache_InstantNotShared(t *testing.T) {
+	fixNow(t)
+
+	window := 5 * time.Minute
+	offset := time.Minute
+
+	rangeMetrics := sdk.TimestampedMetrics{{Timestamp: ts(-2, 0), Value: 1}}
+	instantMetrics := sdk.TimestampedMetrics{{Timestamp: ts(-1, 0), Value: 2}}
+
+	looker := &fakeAPMLooker{results: []fakeAPMResult{
+		{metrics: rangeMetrics},
+		{metrics: instantMetrics},
+	}}
+
+	p := &sdk.ScalingPolicy{ID: "testPolicy"}
+	cache := newQueryMetricsCache()
+
+	mkRunner := func(instant bool) *checkRunner {
+		return newTestCheckRunner(looker, &sdk.ScalingPolicyCheck{
+			Name:              "check",
+			Source:            "mock",
+			Query:             "query",
+			QueryWindow:       window,
+			QueryWindowOffset: offset,
+			QueryInstant:      instant,
+		}, p)
+	}
+
+	gotRange, err := mkRunner(false).queryMetrics(context.Background(), cache)
+	must.NoError(t, err)
+	gotInstant, err := mkRunner(true).queryMetrics(context.Background(), cache)
+	must.NoError(t, err)
+
+	// Checks that differ only in QueryInstant must not share a cache entry.
+	must.Eq(t, 2, looker.calls)
+	must.Eq(t, sdk.TimeRange{From: ts(-6, 0), To: ts(-1, 0)}, looker.ranges[0])
+	must.Eq(t, sdk.TimeRange{From: ts(-1, 0), To: ts(-1, 0)}, looker.ranges[1])
+	must.Eq(t, rangeMetrics, gotRange)
+	must.Eq(t, instantMetrics, gotInstant)
+}
+
+func TestCheckHandler_queryMetricsCache_SufficiencyRulesNotShared(t *testing.T) {
+	fixNow(t)
+
+	metrics := sdk.TimestampedMetrics{{Timestamp: ts(-2, 0), Value: 1}}
+	looker := &fakeAPMLooker{results: []fakeAPMResult{{metrics: metrics}}}
+	p := &sdk.ScalingPolicy{ID: "testPolicy"}
+	cache := newQueryMetricsCache()
+
+	mkRunner := func(minPoints int) *checkRunner {
+		return newTestCheckRunner(looker, &sdk.ScalingPolicyCheck{
+			Name:              "check",
+			Source:            "mock",
+			Query:             "query",
+			QueryWindow:       5 * time.Minute,
+			QueryWindowOffset: time.Minute,
+			QueryMinPoints:    minPoints,
+		}, p)
+	}
+
+	// The first check requires more points than the query returns; the
+	// second shares the cached raw result but applies its own, looser limit.
+	_, err := mkRunner(5).queryMetrics(context.Background(), cache)
+	must.ErrorIs(t, err, errInsufficientMetrics)
+
+	got, err := mkRunner(1).queryMetrics(context.Background(), cache)
+	must.NoError(t, err)
+	must.Eq(t, metrics, got)
+
+	// The APM was queried only once; the sufficiency failure was not cached.
+	must.Eq(t, 1, looker.calls)
+}
+
+func TestCheckHandler_runCheckAndCapCount_MetricErrorHandling(t *testing.T) {
+	fixNow(t)
+
+	onePoint := sdk.TimestampedMetrics{{Timestamp: ts(-2, 0), Value: 1}}
+
+	testCases := []struct {
+		name             string
+		lookerResults    []fakeAPMResult
+		minPoints        int
+		checkOnError     string
+		policyOnError    string
+		wantSkipped      bool
+		wantStrategyRuns int
+	}{
+		// Query failure.
+		{name: "query_error_ignore", lookerResults: []fakeAPMResult{{err: errTest}},
+			checkOnError: sdk.ScalingPolicyOnErrorIgnore, wantSkipped: true},
+		{name: "query_error_fail", lookerResults: []fakeAPMResult{{err: errTest}},
+			checkOnError: sdk.ScalingPolicyOnErrorFail, wantSkipped: false},
+		{name: "query_error_unset_policy_fail", lookerResults: []fakeAPMResult{{err: errTest}},
+			policyOnError: sdk.ScalingPolicyOnErrorFail, wantSkipped: false},
+		{name: "query_error_unset_policy_ignore", lookerResults: []fakeAPMResult{{err: errTest}},
+			policyOnError: sdk.ScalingPolicyOnErrorIgnore, wantSkipped: true},
+		{name: "query_error_unset_policy_unset", lookerResults: []fakeAPMResult{{err: errTest}},
+			wantSkipped: true},
+
+		// Empty result.
+		{name: "empty_ignore", lookerResults: []fakeAPMResult{{metrics: sdk.TimestampedMetrics{}}},
+			checkOnError: sdk.ScalingPolicyOnErrorIgnore, wantSkipped: true},
+		{name: "empty_fail", lookerResults: []fakeAPMResult{{metrics: sdk.TimestampedMetrics{}}},
+			checkOnError: sdk.ScalingPolicyOnErrorFail, wantSkipped: false},
+		{name: "empty_unset_policy_fail", lookerResults: []fakeAPMResult{{metrics: sdk.TimestampedMetrics{}}},
+			policyOnError: sdk.ScalingPolicyOnErrorFail, wantSkipped: false},
+		{name: "empty_unset_policy_ignore", lookerResults: []fakeAPMResult{{metrics: sdk.TimestampedMetrics{}}},
+			policyOnError: sdk.ScalingPolicyOnErrorIgnore, wantSkipped: true},
+		{name: "empty_unset_policy_unset", lookerResults: []fakeAPMResult{{metrics: sdk.TimestampedMetrics{}}},
+			wantSkipped: true},
+
+		// Insufficient data.
+		{name: "insufficient_ignore", lookerResults: []fakeAPMResult{{metrics: onePoint}}, minPoints: 2,
+			checkOnError: sdk.ScalingPolicyOnErrorIgnore, wantSkipped: true},
+		{name: "insufficient_fail", lookerResults: []fakeAPMResult{{metrics: onePoint}}, minPoints: 2,
+			checkOnError: sdk.ScalingPolicyOnErrorFail, wantSkipped: false},
+		{name: "insufficient_unset_policy_fail", lookerResults: []fakeAPMResult{{metrics: onePoint}}, minPoints: 2,
+			policyOnError: sdk.ScalingPolicyOnErrorFail, wantSkipped: false},
+		{name: "insufficient_unset_policy_ignore", lookerResults: []fakeAPMResult{{metrics: onePoint}}, minPoints: 2,
+			policyOnError: sdk.ScalingPolicyOnErrorIgnore, wantSkipped: true},
+		{name: "insufficient_unset_policy_unset", lookerResults: []fakeAPMResult{{metrics: onePoint}}, minPoints: 2,
+			wantSkipped: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			looker := &fakeAPMLooker{results: tc.lookerResults}
+			sr := &mockStrategyRunner{t: t}
+
+			p := &sdk.ScalingPolicy{ID: "testPolicy", OnCheckError: tc.policyOnError}
+
+			runner := newCheckRunner(&CheckRunnerConfig{
+				Log:            hclog.NewNullLogger(),
+				StrategyRunner: sr,
+				MetricsGetter:  looker,
+				Policy:         p,
+			}, &sdk.ScalingPolicyCheck{
+				Name:              "check",
+				Source:            "mock",
+				Query:             "query",
+				QueryWindow:       5 * time.Minute,
+				QueryWindowOffset: time.Minute,
+				QueryMinPoints:    tc.minPoints,
+				OnError:           tc.checkOnError,
+				Strategy:          &sdk.ScalingPolicyStrategy{Name: "strategy"},
+			})
+
+			action, err := runner.runCheckAndCapCount(context.Background(), 5, newQueryMetricsCache())
+			if tc.wantSkipped {
+				must.ErrorIs(t, err, errCheckSkipped)
+				must.Eq(t, sdk.ScalingAction{}, action)
+			} else {
+				must.Error(t, err)
+				must.False(t, errors.Is(err, errCheckSkipped))
+			}
+
+			// The strategy must never run when the metric query failed.
+			must.Eq(t, tc.wantStrategyRuns, sr.runCalls)
+		})
+	}
+}
+
+func Test_metricErrorType(t *testing.T) {
+	must.Eq(t, "query_error", metricErrorType(fmt.Errorf("%w: boom", errMetricsQueryFailed)))
+	must.Eq(t, "query_error", metricErrorType(errTest))
+	must.Eq(t, "empty_result", metricErrorType(errNoMetrics))
+	must.Eq(t, "insufficient_data", metricErrorType(
+		fmt.Errorf("%w: 1 valid data points, minimum is 2", errInsufficientMetrics)))
 }

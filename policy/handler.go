@@ -48,7 +48,6 @@ var (
 	// errTargetNotFound is used by a check handler to indicate the policy target
 	// does not exist or is unavailable.
 	errTargetNotFound = errors.New("target not found")
-	errNoMetrics      = errors.New("no metrics available")
 )
 
 type dependencyGetter interface {
@@ -502,6 +501,10 @@ func (h *Handler) calculateNewCount(ctx context.Context, currentCount int64) (sd
 		if err != nil {
 			if errors.Is(err, errCheckOutsideSchedule) {
 				h.log.Debug("skipping check, outside schedule window")
+				continue
+			}
+			if errors.Is(err, errCheckSkipped) {
+				h.log.Debug("skipping check, metric error downgraded by on_error configuration")
 				continue
 			}
 			return sdk.ScalingAction{}, fmt.Errorf("failed to run check and cap count: %w", err)

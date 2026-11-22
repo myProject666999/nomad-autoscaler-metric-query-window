@@ -28,6 +28,8 @@ const (
 	keyQuery              = "query"
 	keyQueryWindow        = "query_window"
 	keyQueryWindowOffset  = "query_window_offset"
+	keyQueryMinPoints     = "query_min_points"
+	keyQueryMaxStaleness  = "query_max_staleness"
 	keyEvaluationInterval = "evaluation_interval"
 	keyOnCheckError       = "on_check_error"
 	keyOnError            = "on_error"

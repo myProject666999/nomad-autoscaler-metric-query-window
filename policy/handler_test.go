@@ -374,6 +374,29 @@ func TestHandler_calculateNewCount_SentinelErrorsSkipped_UnknownErrorFails(t *te
 			expectedAction: sdk.ScalingAction{},
 		},
 		{
+			name: "check_skipped_by_on_error_continues_evaluation",
+			runners: []*stubChecker{
+				{
+					action: sdk.ScalingAction{Direction: sdk.ScaleDirectionNone, Count: 2},
+					err:    errCheckSkipped,
+				},
+				{
+					action: sdk.ScalingAction{Direction: sdk.ScaleDirectionUp, Count: 5},
+				},
+			},
+			expectedCalls:  []int{1, 1},
+			expectedAction: sdk.ScalingAction{Direction: sdk.ScaleDirectionUp, Count: 5},
+		},
+		{
+			name: "all_checks_skipped_returns_no_action",
+			runners: []*stubChecker{
+				{err: errCheckSkipped},
+				{err: errCheckSkipped},
+			},
+			expectedCalls:  []int{1, 1},
+			expectedAction: sdk.ScalingAction{},
+		},
+		{
 			name: "outside_schedule_then_canceled_aborts",
 			runners: []*stubChecker{
 				{err: errCheckOutsideSchedule},
@@ -597,9 +620,9 @@ func TestNewPolicyHandler_InitialTargetStatusErrorFails(t *testing.T) {
 	t.Parallel()
 
 	h, err := NewPolicyHandler(HandlerConfig{
-		Log:      hclog.NewNullLogger(),
-		Policy:   policy2,
-		Limiter:  NewLimiter(DefaultLimiterTimeout, map[string]int{"horizontal": 1, "cluster": 1}),
+		Log:         hclog.NewNullLogger(),
+		Policy:      policy2,
+		Limiter:     NewLimiter(DefaultLimiterTimeout, map[string]int{"horizontal": 1, "cluster": 1}),
 		UpdatesChan: make(chan *sdk.ScalingPolicy, 1),
 		TargetController: &mockTargetController{
 			statusErr: errTest,
@@ -949,4 +972,75 @@ func TestHandlerScalingNeeded(t *testing.T) {
 					action, tc.currentCount))
 		}
 	}
+}
+
+// TestHandler_calculateNewCount_IgnoredMetricErrorsDoNotBlockOtherChecks runs
+// two real check runners through calculateNewCount: the first has no metrics
+// and on_error=ignore, the second returns a scaling action. The ignored
+// check must not abort the evaluation.
+func TestHandler_calculateNewCount_IgnoredMetricErrorsDoNotBlockOtherChecks(t *testing.T) {
+	nowFunc = func() time.Time {
+		return time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	}
+	t.Cleanup(func() { nowFunc = time.Now })
+
+	p := &sdk.ScalingPolicy{
+		ID:  "test-policy",
+		Min: 1,
+		Max: 10,
+		Target: &sdk.ScalingPolicyTarget{
+			Name:   "mock-target",
+			Config: map[string]string{},
+		},
+	}
+
+	// Check with no metrics available and on_error=ignore.
+	emptyLooker := &fakeAPMLooker{results: []fakeAPMResult{{metrics: sdk.TimestampedMetrics{}}}}
+	ignoredRunner := newCheckRunner(&CheckRunnerConfig{
+		Log:            hclog.NewNullLogger(),
+		StrategyRunner: &mockStrategyRunner{t: t},
+		MetricsGetter:  emptyLooker,
+		Policy:         p,
+	}, &sdk.ScalingPolicyCheck{
+		Name:        "ignored-check",
+		Source:      "mock",
+		Query:       "ignored-query",
+		QueryWindow: 5 * time.Minute,
+		OnError:     sdk.ScalingPolicyOnErrorIgnore,
+		Strategy:    &sdk.ScalingPolicyStrategy{Name: "strategy"},
+	})
+
+	// Healthy check that should still be evaluated. It uses a different
+	// query so it does not share the per-round query cache with the
+	// ignored check.
+	healthyStrategy := &mockStrategyRunner{t: t, count: 5, direction: sdk.ScaleDirectionUp}
+	healthyLooker := &fakeAPMLooker{results: []fakeAPMResult{{metrics: sdk.TimestampedMetrics{
+		{Timestamp: nowFunc().Add(-time.Minute), Value: 1},
+	}}}}
+	healthyRunner := newCheckRunner(&CheckRunnerConfig{
+		Log:            hclog.NewNullLogger(),
+		StrategyRunner: healthyStrategy,
+		MetricsGetter:  healthyLooker,
+		Policy:         p,
+	}, &sdk.ScalingPolicyCheck{
+		Name:        "healthy-check",
+		Source:      "mock",
+		Query:       "healthy-query",
+		QueryWindow: 5 * time.Minute,
+		Strategy:    &sdk.ScalingPolicyStrategy{Name: "strategy"},
+	})
+
+	handler := &Handler{
+		log:          hclog.NewNullLogger(),
+		policy:       p,
+		checkRunners: []checker{ignoredRunner, healthyRunner},
+	}
+
+	action, err := handler.calculateNewCount(context.Background(), 2)
+	must.NoError(t, err)
+	must.Eq(t, int64(5), action.Count)
+	must.Eq(t, sdk.ScaleDirectionUp, action.Direction)
+	must.Eq(t, 1, emptyLooker.calls)
+	must.Eq(t, 1, healthyLooker.calls)
+	must.Eq(t, 1, healthyStrategy.runCalls)
 }

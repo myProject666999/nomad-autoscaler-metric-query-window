@@ -272,3 +272,80 @@ scaling "unsupported-function-policy" {
 	must.StrContains(t, strings.ToLower(err.Error()), "function")
 	must.StrContains(t, strings.ToLower(err.Error()), "file")
 }
+
+func Test_decodePolicyDoc_NegativeDurationsRejected(t *testing.T) {
+	testCases := []struct {
+		name  string
+		check *sdk.FileDecodePolicyCheckDoc
+	}{
+		{
+			name:  "negative_query_window",
+			check: &sdk.FileDecodePolicyCheckDoc{Name: "c", QueryWindowHCL: "-5m"},
+		},
+		{
+			name:  "negative_query_window_offset",
+			check: &sdk.FileDecodePolicyCheckDoc{Name: "c", QueryWindowOffsetHCL: "-1m"},
+		},
+		{
+			name:  "negative_query_max_staleness",
+			check: &sdk.FileDecodePolicyCheckDoc{Name: "c", QueryMaxStalenessHCL: "-30s"},
+		},
+		{
+			name:  "negative_query_min_points",
+			check: &sdk.FileDecodePolicyCheckDoc{Name: "c", QueryMinPoints: -1},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			decodePolicy := &sdk.FileDecodeScalingPolicy{
+				Doc: &sdk.FileDecodePolicyDoc{
+					Checks: []*sdk.FileDecodePolicyCheckDoc{tc.check},
+				},
+			}
+			err := decodePolicyDoc(decodePolicy)
+			assert.Error(t, err)
+			assert.True(t, strings.Contains(err.Error(), "must not be negative"), err.Error())
+		})
+	}
+}
+
+func Test_decodePolicyDoc_OffsetGreaterThanWindowAllowed(t *testing.T) {
+	decodePolicy := &sdk.FileDecodeScalingPolicy{
+		Doc: &sdk.FileDecodePolicyDoc{
+			Checks: []*sdk.FileDecodePolicyCheckDoc{{
+				Name:                 "c",
+				QueryWindowHCL:       "5m",
+				QueryWindowOffsetHCL: "24h",
+			}},
+		},
+	}
+
+	err := decodePolicyDoc(decodePolicy)
+	assert.NoError(t, err)
+	assert.Equal(t, 5*time.Minute, decodePolicy.Doc.Checks[0].QueryWindow)
+	assert.Equal(t, 24*time.Hour, decodePolicy.Doc.Checks[0].QueryWindowOffset)
+}
+
+func Test_decodePolicyDoc_QuerySufficiencyFields(t *testing.T) {
+	decodePolicy := &sdk.FileDecodeScalingPolicy{
+		Doc: &sdk.FileDecodePolicyDoc{
+			Checks: []*sdk.FileDecodePolicyCheckDoc{{
+				Name:                 "c",
+				QueryWindowHCL:       "5m",
+				QueryMinPoints:       3,
+				QueryMaxStalenessHCL: "30s",
+			}},
+		},
+	}
+
+	err := decodePolicyDoc(decodePolicy)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, decodePolicy.Doc.Checks[0].QueryMinPoints)
+	assert.Equal(t, 30*time.Second, decodePolicy.Doc.Checks[0].QueryMaxStaleness)
+
+	translated := &sdk.ScalingPolicyCheck{}
+	decodePolicy.Doc.Checks[0].Translate(translated)
+	assert.Equal(t, 3, translated.QueryMinPoints)
+	assert.Equal(t, 30*time.Second, translated.QueryMaxStaleness)
+}
